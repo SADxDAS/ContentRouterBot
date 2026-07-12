@@ -13,7 +13,8 @@ class Program
         { "CODE", "Архив: Код" },
         { "MEDIA", "Архив: Медиа" },
         { "OTHER", "Архив: Разное" },
-        { "LINK", "Links" }
+        { "LINK", "Links" },
+        { "NOTE", "Notes" }
     };
 
     static async Task Main(string[] args)
