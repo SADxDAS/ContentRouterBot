@@ -26,8 +26,7 @@ class Program
             return;
         }
 
-        using var classifier = new SmartClassifier("my_onnx_model");
-        Console.WriteLine("Нейросеть загружена в память.");
+        using var classifier = new SmartClassifier("Models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"); Console.WriteLine("Нейросеть загружена в память.");
 
         using var client = new Client(Config);
         await client.LoginUserIfNeeded();
@@ -85,13 +84,37 @@ class Program
     // Вынесли логику маршрутизации в отдельный метод, чтобы не дублировать код
     private static async Task ProcessSingleMessage(Message msg, Client client, SmartClassifier classifier, ChatBase sourceChat, List<ChatBase> allChats)
     {
-        string content = msg.message;
-        if (string.IsNullOrWhiteSpace(content) && msg.media != null)
-            content = $"[Медиафайл: {msg.media.GetType().Name}]";
+        string targetChatName = RoutingRules["OTHER"]; // За замовчуванням
+        string content = msg.message?.Trim() ?? "";
 
-        string category = classifier.PredictCategory(content);
-        string targetChatName = RoutingRules.ContainsKey(category) ? RoutingRules[category] : RoutingRules["OTHER"];
+        // КРОК 1: ПЕРЕВІРКА НА ЧИСТЕ МЕДІА (БЕЗ ТЕКСТУ)
+        if (string.IsNullOrEmpty(content) && msg.media != null)
+        {
+            // Якщо це просто фото, відео, гіфка або голосове повідомлення
+            if (msg.media is MessageMediaPhoto || msg.media is MessageMediaDocument)
+            {
+                targetChatName = RoutingRules["MEDIA"];
+            }
+            else
+            {
+                targetChatName = RoutingRules["OTHER"];
+            }
+        }
+        // КРОК 2: ПЕРЕВІРКА НА ЧИСТЕ ПОСИЛАННЯ
+        else if (Uri.IsWellFormedUriString(content, UriKind.Absolute))
+        {
+            // Якщо весь текст повідомлення — це просто валідне посилання
+            targetChatName = RoutingRules["LINK"];
+        }
+        // КРОК 3: ІНТЕЛЕКТУАЛЬНИЙ АНАЛІЗ ТЕКСТУ
+        else if (!string.IsNullOrEmpty(content))
+        {
+            // Віддаємо нейромережі ТІЛЬКИ чистий текст (підпис або саме повідомлення)
+            string category = await classifier.PredictCategory(content); // ДОБАВИЛИ AWAIT
+            targetChatName = RoutingRules.ContainsKey(category) ? RoutingRules[category] : RoutingRules["OTHER"];
+        }
 
+        // --- ЛОГІКА ПЕРЕСИЛАННЯ ---
         var targetChat = allChats.FirstOrDefault(c => c.Title == targetChatName);
 
         if (targetChat != null)
@@ -99,7 +122,7 @@ class Program
             long randomId = WTelegram.Helpers.RandomLong();
             await client.Messages_ForwardMessages(sourceChat, new[] { msg.id }, new[] { randomId }, targetChat);
 
-            Console.WriteLine($"[УСПЕХ] Отправлено в '{targetChatName}'");
+            Console.WriteLine($"[УСПЕХ] Отправлено в '{targetChatName}'. Контент: {(content.Length > 20 ? content.Substring(0, 20) + "..." : (content == "" ? "[МЕДІА]" : content))}");
 
             if (sourceChat is Channel sourceChannel)
                 await client.Channels_DeleteMessages(sourceChannel, new[] { msg.id });
@@ -113,7 +136,6 @@ class Program
             Console.WriteLine($"[ОШИБКА] Целевая группа '{targetChatName}' не найдена!");
         }
     }
-
     private static string? Config(string what)
     {
         switch (what)

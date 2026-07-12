@@ -1,120 +1,77 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using Microsoft.ML.OnnxRuntime;
-using Microsoft.ML.OnnxRuntime.Tensors;
-using Tokenizers.DotNet; // Підключаємо бібліотеку для читання tokenizer.json
+using System.Threading.Tasks;
+using LLama;
+using LLama.Common;
+using LLama.Sampling; // Требуется для DefaultSamplingPipeline в новых версиях
 
 public class SmartClassifier : IDisposable
 {
-    private readonly InferenceSession _session;
-    private readonly Tokenizer _tokenizer;
+    private readonly LLamaWeights _weights;
+    private readonly StatelessExecutor _executor;
 
-    // Наші категорії для маршрутизації
-    private readonly string[] _categories = { "Код и программирование", "Видео, музыка и мемы", "Разное", "Links, ссылки", "Заметки, Notes, текст" };
-    private readonly string[] _categoryKeys = { "CODE", "MEDIA", "OTHER", "LINK","NOTE" };
-
-    public SmartClassifier(string modelFolderPath)
+    public SmartClassifier(string modelPath)
     {
-        string modelPath = System.IO.Path.Combine(modelFolderPath, "model.onnx");
-        string tokenizerPath = System.IO.Path.Combine(modelFolderPath, "tokenizer.json");
-
-        // Завантажуємо модель та токенізатор у пам'ять
-        _session = new InferenceSession(modelPath);
-        _tokenizer = new Tokenizer(tokenizerPath);
-    }
-
-    public string PredictCategory(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text) || text.Length < 3)
-            return "OTHER";
-
-        float bestScore = 0.2f; // Поріг впевненості (можна підкрутити від 0.3 до 0.7)
-        int bestIndex = 2; // OTHER за замовчуванням
-
-        for (int i = 0; i < _categories.Length; i++)
+        var parameters = new ModelParams(modelPath)
         {
-            // Формуємо гіпотезу (Zero-Shot Classification)
-            string hypothesis = $"Этот текст относится к теме: {_categories[i]}.";
-            float entailmentScore = RunOnnxInference(text, hypothesis);
-
-            if (entailmentScore > bestScore)
-            {
-                bestScore = entailmentScore;
-                bestIndex = i;
-            }
-        }
-
-        return _categoryKeys[bestIndex];
-    }
-
-    private float RunOnnxInference(string text, string hypothesis)
-    {
-        // З'єднуємо текст та гіпотезу спеціальними токенами формату XLM-R
-        string combined = $"<s>{text}</s></s>{hypothesis}</s>";
-
-        // 1. Токенізація: перетворюємо текст на числа
-        var encoded = _tokenizer.Encode(combined);
-
-        // Дістаємо ID токенів (кастуємо в long, бо ONNX вимагає 64-бітні числа)
-        long[] inputIds = encoded.Select(id => (long)id).ToArray();
-
-        // Маска уваги (всі одиниці, бо ми не використовуємо доповнення/паддінг)
-        long[] attentionMask = Enumerable.Repeat(1L, inputIds.Length).ToArray();
-
-        int length = inputIds.Length;
-
-        // 2. Пакуємо в ONNX Тензори
-        var inputIdsTensor = new DenseTensor<long>(inputIds, new[] { 1, length });
-        var attentionMaskTensor = new DenseTensor<long>(attentionMask, new[] { 1, length });
-
-        var inputs = new List<NamedOnnxValue>
-        {
-            NamedOnnxValue.CreateFromTensor("input_ids", inputIdsTensor),
-            NamedOnnxValue.CreateFromTensor("attention_mask", attentionMaskTensor)
+            ContextSize = 1024,
+            GpuLayerCount = 20
         };
 
-        // 3. Проганяємо через нейромережу
-        using var results = _session.Run(inputs);
+        _weights = LLamaWeights.LoadFromFile(parameters);
 
-        // Модель повертає 3 числа (Логити):
-        // [0] - Contradiction (Суперечить)
-        // [1] - Neutral (Нейтрально)
-        // [2] - Entailment (Логічне слідування / Підходить)
-        var logits = results.First().AsEnumerable<float>().ToArray();
-
-        // 4. Переводимо абстрактні числа у відсотки (0.0 - 1.0) через Softmax
-        var probabilities = ApplySoftmax(logits);
-
-        // Повертаємо ймовірність того, що текст підходить до гіпотези
-        return probabilities[2];
+        // В новых версиях StatelessExecutor сам создает нужный контекст из весов
+        _executor = new StatelessExecutor(_weights, parameters);
     }
 
-    // Математична функція для перетворення логітів на відсотки
-    private float[] ApplySoftmax(float[] logits)
+    // Делаем метод асинхронным, так как новая LLamaSharp работает только асинхронно
+    public async Task<string> PredictCategory(string text)
     {
-        float maxLogit = logits.Max();
-        float sumExp = 0;
-        float[] expLogits = new float[logits.Length];
+        if (string.IsNullOrWhiteSpace(text))
+            return "OTHER";
 
-        for (int i = 0; i < logits.Length; i++)
+        // Новая структура параметров для LLamaSharp 0.20+
+        var inferenceParams = new InferenceParams()
         {
-            expLogits[i] = (float)Math.Exp(logits[i] - maxLogit);
-            sumExp += expLogits[i];
+            MaxTokens = 5,
+            AntiPrompts = new List<string> { "User:" },
+            SamplingPipeline = new DefaultSamplingPipeline
+            {
+                Temperature = 0.0f
+            }
+        };
+
+        string prompt = $@"<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+Ты безэмоциональный AI-роутер. Твоя задача проанализировать смысл текста и вернуть ТОЛЬКО ОДНО СЛОВО из списка: [CODE, MEDIA, LINK, OTHER, NOTE].
+- Если текст про программирование, IT, софт, разработку, github — верни CODE.
+- Если текст про видео, музыку, мемы, ютуб, игры, развлечения — верни MEDIA.
+- Если текст содержит только ссылки без внятного описания — верни LINK.
+- Если текст содержит записи(текст, примечания) — верни NOTE.
+- Если текст о чем-то другом (быт, новости, мысли) — верни OTHER.
+Никогда не пиши пояснений. Верни ровно одно слово.<|eot_id|><|start_header_id|>user<|end_header_id|>
+Текст для анализа: {text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
+
+        string response = "";
+
+        // Используем InferAsync вместо Infer и собираем токены через await foreach
+        await foreach (var token in _executor.InferAsync(prompt, inferenceParams))
+        {
+            response += token;
         }
 
-        for (int i = 0; i < logits.Length; i++)
-        {
-            expLogits[i] /= sumExp;
-        }
+        response = response.ToUpper().Trim();
 
-        return expLogits;
+        if (response.Contains("CODE")) return "CODE";
+        if (response.Contains("MEDIA")) return "MEDIA";
+        if (response.Contains("LINK")) return "LINK";
+        if (response.Contains("NOTE")) return "NOTE";
+
+        return "OTHER";
     }
 
     public void Dispose()
     {
-        _session?.Dispose();
-        if (_tokenizer is IDisposable disposableTokenizer)
-            disposableTokenizer.Dispose();
+        _weights?.Dispose();
     }
 }
