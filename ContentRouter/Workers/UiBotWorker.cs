@@ -15,6 +15,7 @@ using InlineButton = Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton;
 public class UiBotWorker : BackgroundService
 {
     private readonly IChannelRepository _repository;
+    private readonly string[] _tags = { "Pvideo", "Pimages", "OnlyK", "Himages", "Hvideo", "Hmanga", "Hmix", "Hgame", "IGNORE", "OTHER" };
     private readonly HashSet<string> _skippedItems = new();
 
     public UiBotWorker(IChannelRepository repository)
@@ -34,23 +35,22 @@ public class UiBotWorker : BackgroundService
 
     private async Task HandleBotUpdateAsync(ITelegramBotClient bot, BotUpdate update, CancellationToken ct)
     {
-        // SINGLE MESSAGE APP LOGIC
         if (update.Type == BotType.Message)
         {
-            if (update.Message != null)
-            {
-                // Пытаемся удалить сообщение пользователя, чтобы не засорять чат
-                try { await bot.DeleteMessage(update.Message.Chat.Id, update.Message.MessageId); } catch { }
+            var msg = update.Message;
 
-                // Удаляем старое меню
+            // Удаляем ТОЛЬКО команды управления меню. Контент мы не трогаем!
+            if (msg != null && (msg.Text == "/start" || msg.Text == "/menu"))
+            {
+                try { await bot.DeleteMessage(msg.Chat.Id, msg.MessageId); } catch { }
+
                 var activeMenu = _repository.GetActiveMenu();
                 if (activeMenu != null)
                 {
                     try { await bot.DeleteMessage(activeMenu.Value.ChatId, activeMenu.Value.MessageId); } catch { }
                 }
 
-                // Рисуем новое меню
-                await ShowMainMenu(bot, update.Message.Chat.Id, isNewMessage: true);
+                await ShowMainMenu(bot, msg.Chat.Id, isNewMessage: true);
             }
         }
         else if (update.Type == BotType.CallbackQuery)
@@ -72,6 +72,22 @@ public class UiBotWorker : BackgroundService
                 else if (action == "set_dom") { _repository.SaveDomainTag(data[1], data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "ignore_dom") { _repository.SaveDomainTag(data[1], "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "skip_dom") { _skippedItems.Add(data[1]); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+
+                // РЕДАКТОР ТЕГОВ
+                else if (action == "edit_cats") { await ShowCategoriesForEdit(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "edit_list") { await ShowItemsByTag(bot, cq.Message.Chat.Id, cq.Message.MessageId, data[1]); }
+                else if (action == "remove_ch")
+                {
+                    _repository.RemoveTag(long.Parse(data[1]));
+                    await bot.AnswerCallbackQuery(cq.Id, "🗑 Канал удален");
+                    await ShowCategoriesForEdit(bot, cq.Message.Chat.Id, cq.Message.MessageId);
+                }
+                else if (action == "remove_dom")
+                {
+                    _repository.RemoveDomainTag(data[1]);
+                    await bot.AnswerCallbackQuery(cq.Id, "🗑 Домен удален");
+                    await ShowCategoriesForEdit(bot, cq.Message.Chat.Id, cq.Message.MessageId);
+                }
             }
             catch (Exception ex) { Console.WriteLine($"[UI-ERROR] {ex.Message}"); }
         }
@@ -79,12 +95,17 @@ public class UiBotWorker : BackgroundService
 
     private async Task ShowMainMenu(ITelegramBotClient bot, long chatId, int? msgId = null, bool isNewMessage = false)
     {
-        var channels = _repository.GetAvailableChannels().Keys.Count(k => !_repository.GetMappings().ContainsKey(k));
-        var domains = _repository.GetAvailableDomains().Count(d => !_repository.GetDomainMappings().ContainsKey(d));
+        var chMappings = _repository.GetMappings();
+        var domMappings = _repository.GetDomainMappings();
+
+        var channels = _repository.GetAvailableChannels().Keys.Count(k => !chMappings.ContainsKey(k));
+        var domains = _repository.GetAvailableDomains().Count(d => !domMappings.ContainsKey(d));
+        var totalMappings = chMappings.Count + domMappings.Count;
 
         var keyboard = new InlineKeyboard(new[] {
             new[] { InlineButton.WithCallbackData($"📢 Новые каналы ({channels})", "untagged_ch") },
-            new[] { InlineButton.WithCallbackData($"🔗 Новые домены ({domains})", "untagged_dom") }
+            new[] { InlineButton.WithCallbackData($"🔗 Новые домены ({domains})", "untagged_dom") },
+            new[] { InlineButton.WithCallbackData($"📋 Мои привязки ({totalMappings})", "edit_cats") }
         });
 
         string text = "🎛 <b>Маршрутизатор (SingleApp)</b>\nВыберите действие:";
@@ -119,12 +140,71 @@ public class UiBotWorker : BackgroundService
         await bot.EditMessageText(chatId, msgId, $"Куда отправлять ссылки с доменом:\n👉 <b>{next}</b>", replyMarkup: kb, parseMode: ParseMode.Html);
     }
 
+    // ==========================================
+    // НЕДОСТАЮЩИЕ МЕТОДЫ РЕДАКТОРА ТЕГОВ
+    // ==========================================
+    private async Task ShowCategoriesForEdit(ITelegramBotClient bot, long chatId, int msgId)
+    {
+        var chMappings = _repository.GetMappings();
+        var domMappings = _repository.GetDomainMappings();
+
+        var buttons = new List<InlineButton[]>();
+
+        for (int i = 0; i < _tags.Length; i += 2)
+        {
+            var row = new List<InlineButton>();
+
+            string tag1 = _tags[i];
+            int count1 = chMappings.Values.Count(v => v == tag1) + domMappings.Values.Count(v => v == tag1);
+            row.Add(InlineButton.WithCallbackData($"{tag1} ({count1})", $"edit_list|{tag1}"));
+
+            if (i + 1 < _tags.Length)
+            {
+                string tag2 = _tags[i + 1];
+                int count2 = chMappings.Values.Count(v => v == tag2) + domMappings.Values.Count(v => v == tag2);
+                row.Add(InlineButton.WithCallbackData($"{tag2} ({count2})", $"edit_list|{tag2}"));
+            }
+            buttons.Add(row.ToArray());
+        }
+
+        buttons.Add(new[] { InlineButton.WithCallbackData("🔙 В меню", "menu") });
+
+        await bot.EditMessageText(chatId, msgId, "📂 <b>Выберите категорию для редактирования:</b>", replyMarkup: new InlineKeyboard(buttons), parseMode: ParseMode.Html);
+    }
+
+    private async Task ShowItemsByTag(ITelegramBotClient bot, long chatId, int msgId, string tag)
+    {
+        var chMappings = _repository.GetMappings();
+        var domMappings = _repository.GetDomainMappings();
+        var availableCh = _repository.GetAvailableChannels();
+
+        var channels = chMappings.Where(x => x.Value == tag).Take(30).ToList();
+        var domains = domMappings.Where(x => x.Value == tag).Take(30).ToList();
+
+        var buttons = new List<InlineButton[]>();
+
+        foreach (var c in channels)
+        {
+            string name = availableCh.ContainsKey(c.Key) ? availableCh[c.Key].Title : $"ID: {c.Key}";
+            if (name.Length > 25) name = name.Substring(0, 25) + "..";
+            buttons.Add(new[] { InlineButton.WithCallbackData($"❌ 📢 {name}", $"remove_ch|{c.Key}") });
+        }
+
+        foreach (var d in domains)
+        {
+            buttons.Add(new[] { InlineButton.WithCallbackData($"❌ 🔗 {d.Key}", $"remove_dom|{d.Key}") });
+        }
+
+        buttons.Add(new[] { InlineButton.WithCallbackData("🔙 Назад к категориям", "edit_cats") });
+
+        await bot.EditMessageText(chatId, msgId, $"📌 Привязки для <b>{tag}</b>\n<i>(Нажми на элемент, чтобы удалить привязку)</i>", replyMarkup: new InlineKeyboard(buttons), parseMode: ParseMode.Html);
+    }
+
     private InlineKeyboard GetTagsKeyboard(string id, string type, string url)
     {
         var btns = new List<InlineButton[]>();
         if (!string.IsNullOrEmpty(url)) btns.Add(new[] { InlineButton.WithUrl("👀 Открыть канал", url) });
 
-        // Pmix - это тег, который бот будет разбивать на Pvideo и Pimages
         btns.Add(new[] { InlineButton.WithCallbackData("🎥 Pvideo", $"set_{type}|{id}|Pvideo"), InlineButton.WithCallbackData("🖼 Pimages", $"set_{type}|{id}|Pimages") });
         btns.Add(new[] { InlineButton.WithCallbackData("🔀 Pmix (Авто)", $"set_{type}|{id}|Pmix"), InlineButton.WithCallbackData("🌟 OnlyK", $"set_{type}|{id}|OnlyK") });
 
