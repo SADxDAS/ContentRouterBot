@@ -1,0 +1,38 @@
+{
+  "OTHER": {
+    "Chat": "Архив: Разное",
+    "TopicId": null
+  },
+  "TRASH": {
+    "Chat": "Trash",
+    "TopicId": null
+  },
+  "Pvideo": {
+    "Chat": "Архив 18+",
+    "TopicId": 2
+  },
+  "Pimages": {
+    "Chat": "Архив 18+",
+    "TopicId": 13
+  },
+  "OnlyK": {
+    "Chat": "Архив 18+",
+    "TopicId": 7
+  },
+  "Himages": {
+    "Chat": "Архив 18+",
+    "TopicId": 9
+  },
+  "Hvideo": {
+    "Chat": "Архив 18+",
+    "TopicId": 18
+  },
+  "Hmanga": {
+    "Chat": "Архив 18+",
+    "TopicId": 11
+  },
+  "Hgame": {
+    "Chat": "Архив 18+",
+    "TopicId": 16
+  }
+}
