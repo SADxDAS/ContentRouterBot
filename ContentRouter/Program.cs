@@ -1,4 +1,3 @@
-// Program.cs
 using System;
 using System.Threading.Tasks;
 using DotNetEnv;
@@ -14,21 +13,14 @@ class Program
         var host = Host.CreateDefaultBuilder(args)
             .ConfigureServices((context, services) =>
             {
-                // Регистрация инфраструктурного слоя (JSON репозиторий)
                 services.AddSingleton<IChannelRepository, JsonChannelRepository>();
-
-                // Регистрация сервиса нейросети (загрузка весов Llama один раз)
-                services.AddSingleton<IAiClassifier>(provider =>
-                    new LlamaClassifier("Models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"));
-
-                // Регистрация фоновых процессов
                 services.AddHostedService<UiBotWorker>();
                 services.AddHostedService<UserBotWorker>();
             })
             .Build();
 
         Console.WriteLine("====================================================");
-        Console.WriteLine("🚀 Модульный маршрутизатор ContentRouter успешно запущен");
+        Console.WriteLine("🚀 FastRouter (Rule-based) успешно запущен");
         Console.WriteLine("====================================================");
 
         await host.RunAsync();
