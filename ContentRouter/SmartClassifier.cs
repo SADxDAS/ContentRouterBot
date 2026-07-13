@@ -31,7 +31,6 @@ public class SmartClassifier : IDisposable
         if (string.IsNullOrWhiteSpace(text))
             return "OTHER";
 
-        // Новая структура параметров для LLamaSharp 0.20+
         var inferenceParams = new InferenceParams()
         {
             MaxTokens = 5,
@@ -42,19 +41,19 @@ public class SmartClassifier : IDisposable
             }
         };
 
+        // ОНОВЛЕНИЙ ПРОМПТ: Додали NOTE та інструкцію для нього
         string prompt = $@"<|begin_of_text|><|start_header_id|>system<|end_header_id|>
-Ты безэмоциональный AI-роутер. Твоя задача проанализировать смысл текста и вернуть ТОЛЬКО ОДНО СЛОВО из списка: [CODE, MEDIA, LINK, OTHER, NOTE].
+Ты безэмоциональный AI-роутер. Твоя задача проанализировать смысл текста и вернуть ТОЛЬКО ОДНО СЛОВО из списка: [CODE, MEDIA, LINK, NOTE, OTHER].
 - Если текст про программирование, IT, софт, разработку, github — верни CODE.
 - Если текст про видео, музыку, мемы, ютуб, игры, развлечения — верни MEDIA.
 - Если текст содержит только ссылки без внятного описания — верни LINK.
-- Если текст содержит записи(текст, примечания) — верни NOTE.
-- Если текст о чем-то другом (быт, новости, мысли) — верни OTHER.
+- Если это личная заметка, мысль, идея, список покупок/дел, скопированный кусок текста для памяти, рецепт или контактные данные — верни NOTE.
+- Если текст о чем-то совершенно другом (или непонятный набор букв) — верни OTHER.
 Никогда не пиши пояснений. Верни ровно одно слово.<|eot_id|><|start_header_id|>user<|end_header_id|>
 Текст для анализа: {text}<|eot_id|><|start_header_id|>assistant<|end_header_id|>";
 
         string response = "";
 
-        // Используем InferAsync вместо Infer и собираем токены через await foreach
         await foreach (var token in _executor.InferAsync(prompt, inferenceParams))
         {
             response += token;
@@ -62,14 +61,14 @@ public class SmartClassifier : IDisposable
 
         response = response.ToUpper().Trim();
 
+        // Перевіряємо відповідь моделі
         if (response.Contains("CODE")) return "CODE";
         if (response.Contains("MEDIA")) return "MEDIA";
         if (response.Contains("LINK")) return "LINK";
-        if (response.Contains("NOTE")) return "NOTE";
+        if (response.Contains("NOTE")) return "NOTE"; // Додали обробку тегу
 
         return "OTHER";
     }
-
     public void Dispose()
     {
         _weights?.Dispose();

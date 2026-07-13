@@ -26,7 +26,9 @@ class Program
             return;
         }
 
-        using var classifier = new SmartClassifier("Models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf"); Console.WriteLine("Нейросеть загружена в память.");
+        // Шлях до нової моделі Llama 3
+        using var classifier = new SmartClassifier("Models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf");
+        Console.WriteLine("Нейросеть Llama загружена в память.");
 
         using var client = new Client(Config);
         await client.LoginUserIfNeeded();
@@ -44,98 +46,118 @@ class Program
             return;
         }
 
-        // 1. СНАЧАЛА РАЗГРЕБАЕМ СТАРЫЕ ЗАВАЛЫ (если бот был выключен)
+        // 1. РАЗГРЕБАЕМ СТАРЫЕ ЗАВАЛЫ (з підтримкою альбомів)
         Console.WriteLine("Проверяю накопившиеся сообщения...");
         var history = await client.Messages_GetHistory(sourceChat, limit: 50);
         var messagesToProcess = history.Messages.OfType<Message>().ToList();
+        messagesToProcess.Reverse();
 
-        messagesToProcess.Reverse(); // От старых к новым
-        foreach (var msg in messagesToProcess)
+        // Групуємо повідомлення за grouped_id (якщо grouped_id = 0, це одиночне повідомлення)
+        var historyGroups = messagesToProcess
+            .GroupBy(m => m.grouped_id == 0 ? m.id : m.grouped_id)
+            .ToList();
+
+        foreach (var group in historyGroups)
         {
-            await ProcessSingleMessage(msg, client, classifier, sourceChat, allChats);
+            await ProcessMessageGroup(group.ToList(), client, classifier, sourceChat, allChats);
         }
 
-
-        // 2. ПОДКЛЮЧАЕМ СЛУШАТЕЛЯ РЕАЛЬНОГО ВРЕМЕНИ
+        // 2. СЛУХАЧ РЕАЛЬНОГО ЧАСУ (з підтримкою альбомів)
         client.OnUpdates += async (UpdatesBase updates) =>
         {
-            // Библиотека теперь сразу отдает объект UpdatesBase, так что проверка типов больше не нужна!
+            var validMessages = new List<Message>();
+
+            // Збираємо всі нові повідомлення з поточного оновлення
             foreach (var update in updates.UpdateList)
             {
-                // Ловим новые сообщения из групп (UpdateNewMessage) и каналов (UpdateNewChannelMessage)
                 Message msg = null;
                 if (update is UpdateNewMessage unm) msg = unm.message as Message;
                 else if (update is UpdateNewChannelMessage uncm) msg = uncm.message as Message;
 
-                // Если это сообщение и оно именно из нашей Свалки
                 if (msg != null && msg.peer_id.ID == sourceChat.ID)
                 {
-                    Console.WriteLine("\n[LIVE] Прилетело новое сообщение!");
-                    await ProcessSingleMessage(msg, client, classifier, sourceChat, allChats);
+                    validMessages.Add(msg);
+                }
+            }
+
+            // Групуємо нові повідомлення в альбоми
+            var liveGroups = validMessages
+                .GroupBy(m => m.grouped_id == 0 ? m.id : m.grouped_id)
+                .ToList();
+
+            foreach (var group in liveGroups)
+            {
+                if (group.Any())
+                {
+                    Console.WriteLine($"\n[LIVE] Прилетела группа из {group.Count()} сообщений (Альбом/Пост)!");
+                    await ProcessMessageGroup(group.ToList(), client, classifier, sourceChat, allChats);
                 }
             }
         };
 
-        // 3. БЛОКИРУЕМ ЗАКРЫТИЕ ПРОГРАММЫ
         Console.WriteLine("\n=== Бот перешел в режим ожидания. Нажми Ctrl+C для выхода ===");
-        await Task.Delay(-1); // Бесконечное ожидание
+        await Task.Delay(-1);
     }
 
-    // Вынесли логику маршрутизации в отдельный метод, чтобы не дублировать код
-    private static async Task ProcessSingleMessage(Message msg, Client client, SmartClassifier classifier, ChatBase sourceChat, List<ChatBase> allChats)
+    // НОВИЙ МЕТОД: Обробляє масив повідомлень (Альбом) як єдине ціле
+    private static async Task ProcessMessageGroup(List<Message> msgs, Client client, SmartClassifier classifier, ChatBase sourceChat, List<ChatBase> allChats)
     {
-        string targetChatName = RoutingRules["OTHER"]; // За замовчуванням
-        string content = msg.message?.Trim() ?? "";
+        if (msgs.Count == 0) return;
 
-        // КРОК 1: ПЕРЕВІРКА НА ЧИСТЕ МЕДІА (БЕЗ ТЕКСТУ)
-        if (string.IsNullOrEmpty(content) && msg.media != null)
+        // Збираємо весь текст з альбому (зазвичай текст є тільки під однією фотографією)
+        string content = string.Join(" ", msgs.Select(m => m.message?.Trim()).Where(s => !string.IsNullOrEmpty(s)));
+        string targetChatName = RoutingRules["OTHER"];
+
+        // Перевіряємо, чи є в цьому альбомі медіафайли
+        bool hasMedia = msgs.Any(m => m.media != null && (m.media is MessageMediaPhoto || m.media is MessageMediaDocument));
+
+        // КРОК 1: ПЕРЕВІРКА НА ЧИСТЕ МЕДІА (фото/відео БЕЗ ТЕКСТУ)
+        if (string.IsNullOrEmpty(content) && hasMedia)
         {
-            // Якщо це просто фото, відео, гіфка або голосове повідомлення
-            if (msg.media is MessageMediaPhoto || msg.media is MessageMediaDocument)
-            {
-                targetChatName = RoutingRules["MEDIA"];
-            }
-            else
-            {
-                targetChatName = RoutingRules["OTHER"];
-            }
+            targetChatName = RoutingRules["MEDIA"];
         }
-        // КРОК 2: ПЕРЕВІРКА НА ЧИСТЕ ПОСИЛАННЯ
+        // КРОК 2: ПЕРЕВІРКА НА ПОСИЛАННЯ
         else if (Uri.IsWellFormedUriString(content, UriKind.Absolute))
         {
-            // Якщо весь текст повідомлення — це просто валідне посилання
             targetChatName = RoutingRules["LINK"];
         }
-        // КРОК 3: ІНТЕЛЕКТУАЛЬНИЙ АНАЛІЗ ТЕКСТУ
+        // КРОК 3: ІНТЕЛЕКТУАЛЬНИЙ АНАЛІЗ ТЕКСТУ (Llama 3)
         else if (!string.IsNullOrEmpty(content))
         {
-            // Віддаємо нейромережі ТІЛЬКИ чистий текст (підпис або саме повідомлення)
-            string category = await classifier.PredictCategory(content); // ДОБАВИЛИ AWAIT
+            string category = await classifier.PredictCategory(content);
             targetChatName = RoutingRules.ContainsKey(category) ? RoutingRules[category] : RoutingRules["OTHER"];
         }
 
-        // --- ЛОГІКА ПЕРЕСИЛАННЯ ---
         var targetChat = allChats.FirstOrDefault(c => c.Title == targetChatName);
 
         if (targetChat != null)
         {
-            long randomId = WTelegram.Helpers.RandomLong();
-            await client.Messages_ForwardMessages(sourceChat, new[] { msg.id }, new[] { randomId }, targetChat);
+            // Беремо масив усіх ID з цього альбому
+            int[] msgIds = msgs.Select(m => m.id).ToArray();
 
-            Console.WriteLine($"[УСПЕХ] Отправлено в '{targetChatName}'. Контент: {(content.Length > 20 ? content.Substring(0, 20) + "..." : (content == "" ? "[МЕДІА]" : content))}");
+            // Генеруємо випадкові ID для пересилання (вимога Telegram API)
+            long[] randomIds = msgs.Select(_ => WTelegram.Helpers.RandomLong()).ToArray();
 
+            // ПЕРЕСИЛАЄМО ВЕСЬ АЛЬБОМ ОДНІЄЮ КОМАНДОЮ
+            await client.Messages_ForwardMessages(sourceChat, msgIds, randomIds, targetChat);
+
+            string logText = content.Length > 20 ? content.Substring(0, 20) + "..." : (content == "" ? "[АЛЬБОМ БЕЗ ТЕКСТУ]" : content);
+            Console.WriteLine($"[УСПЕХ] Переслано {msgs.Count} шт. в '{targetChatName}'. Текст: {logText}");
+
+            // ВИДАЛЯЄМО ВЕСЬ АЛЬБОМ ЗІ СМІТНИКА
             if (sourceChat is Channel sourceChannel)
-                await client.Channels_DeleteMessages(sourceChannel, new[] { msg.id });
+                await client.Channels_DeleteMessages(sourceChannel, msgIds);
             else
-                await client.Messages_DeleteMessages(new[] { msg.id }, revoke: true);
+                await client.Messages_DeleteMessages(msgIds, revoke: true);
 
-            await Task.Delay(1000); // Анти-спам
+            await Task.Delay(1500); // Анти-спам (зробили трохи більше для альбомів)
         }
         else
         {
             Console.WriteLine($"[ОШИБКА] Целевая группа '{targetChatName}' не найдена!");
         }
     }
+
     private static string? Config(string what)
     {
         switch (what)
