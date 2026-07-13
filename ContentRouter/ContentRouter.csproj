@@ -12,6 +12,7 @@
     <PackageReference Include="LLamaSharp" Version="0.27.0" />
     <PackageReference Include="LLamaSharp.Backend.Cuda12" Version="0.27.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.9" />
+    <PackageReference Include="Telegram.Bot" Version="22.10.1.1" />
     <PackageReference Include="Tokenizers.DotNet.runtime.win-x64" Version="1.4.1" />
     <PackageReference Include="WTelegramClient" Version="4.4.7" />
 	<None Update=".env">
