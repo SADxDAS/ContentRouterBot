@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,9 +16,15 @@ using InlineButton = Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton;
 public class UiBotWorker : BackgroundService
 {
     private readonly IChannelRepository _repository;
-    private readonly string[] _tags = { "Pvideo", "Pimages", "OnlyK", "Himages", "Hvideo", "Hmanga", "Hmix", "Hgame", "IGNORE", "OTHER" };
-    private readonly HashSet<string> _skippedItems = new();
+    private readonly string[] _tags = { "Pvideo", "Pimages", "OnlyK", "Himages", "Hvideo", "Hmanga", "Hmix", "Hgame", "IGNORE", "OTHER", "MANUAL" }; private readonly HashSet<string> _skippedItems = new();
     private ITelegramBotClient _botClient;
+    private int _currentPreviewIndex = 0;
+
+    private int _lastPreviewedMsgId = 0;
+    private CancellationTokenSource _debounceCts;
+
+    // ДОБАВЛЕНО: Потокобезопасная коллекция для хранения ID пересланных превью
+    private readonly ConcurrentBag<int> _previewMessageIds = new();
 
     public UiBotWorker(IChannelRepository repository)
     {
@@ -33,25 +40,36 @@ public class UiBotWorker : BackgroundService
 
         _repository.OnNewUntaggedItem += () =>
         {
+            _debounceCts?.Cancel();
+            _debounceCts = new CancellationTokenSource();
+            var token = _debounceCts.Token;
+
             _ = Task.Run(async () =>
             {
-                long chatId = _repository.GetAdminChatId();
-                if (chatId == 0) return;
-
-                var active = _repository.GetActiveMenu();
-                if (active != null) try { await _botClient.DeleteMessage(active.Value.ChatId, active.Value.MessageId); } catch { }
-
                 try
                 {
+                    await Task.Delay(1500, token);
+                    if (token.IsCancellationRequested) return;
+
+                    long chatId = _repository.GetAdminChatId();
+                    if (chatId == 0) return;
+
+                    var active = _repository.GetActiveMenu();
+                    var pendingMsgs = _repository.GetPendingDirectMessages().Keys.ToList();
+
+                    if (pendingMsgs.Count > 0)
+                    {
+                        await ShowCurrentMessageMenu(chatId, active?.MessageId);
+                        return;
+                    }
+
                     var nextCh = _repository.GetAvailableChannels().FirstOrDefault(c => !_repository.GetMappings().ContainsKey(c.Key) && !_skippedItems.Contains(c.Key.ToString()));
-                    if (nextCh.Key != 0) { await ShowNextUntaggedChannel(_botClient, chatId, null, isNewMessage: true); return; }
+                    if (nextCh.Key != 0) { await ShowNextUntaggedChannel(_botClient, chatId, active?.MessageId, isNewMessage: true); return; }
 
                     var nextDom = _repository.GetAvailableDomains().FirstOrDefault(d => !_repository.GetDomainMappings().ContainsKey(d.Key) && !_skippedItems.Contains(d.Key));
-                    if (nextDom.Key != null) { await ShowNextUntaggedDomain(_botClient, chatId, null, isNewMessage: true); return; }
-
-                    var nextDir = _repository.GetPendingDirectMessages().FirstOrDefault(d => !_skippedItems.Contains("dir_" + d.Key));
-                    if (nextDir.Key != 0) { await ShowNextUntaggedDirect(_botClient, chatId, null, isNewMessage: true); return; }
+                    if (nextDom.Key != null) { await ShowNextUntaggedDomain(_botClient, chatId, active?.MessageId, isNewMessage: true); return; }
                 }
+                catch (TaskCanceledException) { }
                 catch (Exception ex) { Console.WriteLine($"[UI-AUTO-PROMPT ERROR] {ex.Message}"); }
             });
         };
@@ -60,17 +78,34 @@ public class UiBotWorker : BackgroundService
         return Task.CompletedTask;
     }
 
+    // ДОБАВЛЕНО: Метод для очистки всех пересланных медиа из чата
+    private async Task ClearPreviews(ITelegramBotClient bot, long chatId)
+    {
+        while (_previewMessageIds.TryTake(out int id))
+        {
+            try { await bot.DeleteMessage(chatId, id); } catch { }
+        }
+    }
+
     private async Task HandleBotUpdateAsync(ITelegramBotClient bot, BotUpdate update, CancellationToken ct)
     {
         if (update.Type == BotType.Message)
         {
             var msg = update.Message;
-            if (msg != null && (msg.Text == "/start" || msg.Text == "/menu"))
+            if (msg != null)
             {
-                try { await bot.DeleteMessage(msg.Chat.Id, msg.MessageId); } catch { }
-                var activeMenu = _repository.GetActiveMenu();
-                if (activeMenu != null) try { await bot.DeleteMessage(activeMenu.Value.ChatId, activeMenu.Value.MessageId); } catch { }
-                await ShowMainMenu(bot, msg.Chat.Id, isNewMessage: true);
+                if (msg.Text == "/start" || msg.Text == "/menu")
+                {
+                    try { await bot.DeleteMessage(msg.Chat.Id, msg.MessageId); } catch { }
+                    var activeMenu = _repository.GetActiveMenu();
+                    if (activeMenu != null) try { await bot.DeleteMessage(activeMenu.Value.ChatId, activeMenu.Value.MessageId); } catch { }
+                    await ShowMainMenu(bot, msg.Chat.Id, isNewMessage: true);
+                }
+                else
+                {
+                    // ДОБАВЛЕНО: Если это не команда, значит это пересланное превью от юзербота. Сохраняем его ID.
+                    _previewMessageIds.Add(msg.MessageId);
+                }
             }
         }
         else if (update.Type == BotType.CallbackQuery)
@@ -83,10 +118,13 @@ public class UiBotWorker : BackgroundService
             {
                 if (action == "pause_bot") { _repository.IsPaused = true; await ShowMainMenu(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "resume_bot") { _repository.IsPaused = false; await ShowMainMenu(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "menu") await ShowMainMenu(bot, cq.Message.Chat.Id, cq.Message.MessageId);
+                else if (action == "menu") { await ClearPreviews(bot, cq.Message.Chat.Id); await ShowMainMenu(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "untagged_ch") { _skippedItems.Clear(); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "untagged_dom") { _skippedItems.Clear(); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "untagged_dir") { _skippedItems.Clear(); await ShowNextUntaggedDirect(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+
+                else if (action == "untagged_dir") { _skippedItems.Clear(); _currentPreviewIndex = 0; await ShowCurrentMessageMenu(cq.Message.Chat.Id, cq.Message.MessageId); }
+
+                else if (action == "next_msg") { await ClearPreviews(bot, cq.Message.Chat.Id); _currentPreviewIndex++; await ShowCurrentMessageMenu(cq.Message.Chat.Id, cq.Message.MessageId); }
 
                 else if (action == "set_ch") { _repository.SaveTag(long.Parse(data[1]), data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "ignore_ch") { _repository.SaveTag(long.Parse(data[1]), "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
@@ -96,8 +134,19 @@ public class UiBotWorker : BackgroundService
                 else if (action == "ignore_dom") { _repository.SaveDomainTag(data[1], "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "skip_dom") { _skippedItems.Add(data[1]); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
 
-                else if (action == "set_dir") { _repository.SaveDirectMessageTag(int.Parse(data[1]), data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedDirect(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "skip_dir") { _skippedItems.Add("dir_" + data[1]); await ShowNextUntaggedDirect(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "set_dir")
+                {
+                    await ClearPreviews(bot, cq.Message.Chat.Id); // Удаляем превью после выбора тега
+                    _repository.SaveDirectMessageTag(int.Parse(data[1]), data[2]);
+                    await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}");
+                    await ShowCurrentMessageMenu(cq.Message.Chat.Id, cq.Message.MessageId);
+                }
+                else if (action == "skip_dir")
+                {
+                    await ClearPreviews(bot, cq.Message.Chat.Id); // Удаляем превью при пропуске
+                    _currentPreviewIndex++;
+                    await ShowCurrentMessageMenu(cq.Message.Chat.Id, cq.Message.MessageId);
+                }
 
                 else if (action == "edit_cats") { await ShowCategoriesForEdit(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "edit_list") { int p = data.Length > 2 ? int.Parse(data[2]) : 0; await ShowItemsByTag(bot, cq.Message.Chat.Id, cq.Message.MessageId, data[1], p); }
@@ -112,7 +161,7 @@ public class UiBotWorker : BackgroundService
     {
         var channels = _repository.GetAvailableChannels().Keys.Count(k => !_repository.GetMappings().ContainsKey(k));
         var domains = _repository.GetAvailableDomains().Count(d => !_repository.GetDomainMappings().ContainsKey(d.Key));
-        var directMsgs = _repository.GetPendingDirectMessages().Count(d => !_skippedItems.Contains("dir_" + d.Key));
+        var directMsgs = _repository.GetPendingDirectMessages().Count;
         var totalMappings = _repository.GetMappings().Count + _repository.GetDomainMappings().Count;
 
         bool isPaused = _repository.IsPaused;
@@ -130,6 +179,50 @@ public class UiBotWorker : BackgroundService
         string text = $"🎛 <b>Маршрутизатор (SingleApp)</b>\nСтатус: {(isPaused ? "⏸ ПАУЗА" : "▶️ РАБОТАЕТ")}\nВыберите действие:";
         if (isNewMessage || msgId == null) { var msg = await bot.SendMessage(chatId, text, replyMarkup: keyboard, parseMode: ParseMode.Html); _repository.SetActiveMenu(chatId, msg.MessageId); }
         else { await bot.EditMessageText(chatId, msgId.Value, text, replyMarkup: keyboard, parseMode: ParseMode.Html); }
+    }
+
+    private async Task ShowCurrentMessageMenu(long chatId, int? msgIdToEdit)
+    {
+        var pendingMsgs = _repository.GetPendingDirectMessages().Keys.ToList();
+
+        if (pendingMsgs.Count == 0)
+        {
+            string emptyText = "🎉 Все файлы из Свалки отсортированы!";
+            if (msgIdToEdit.HasValue) try { await _botClient.EditMessageText(chatId, msgIdToEdit.Value, emptyText); } catch { }
+            else await _botClient.SendMessage(chatId, emptyText);
+            return;
+        }
+
+        if (_currentPreviewIndex >= pendingMsgs.Count) _currentPreviewIndex = 0;
+
+        int currentMsgId = pendingMsgs[_currentPreviewIndex];
+
+        string text = $"<b>Куда отправить сообщение №{_currentPreviewIndex + 1} из {pendingMsgs.Count}?</b>\n⬆️ <i>Превью загружено выше</i>";
+
+        // ДОБАВЛЕНО: Все доступные теги на клавиатуре
+        var btns = new List<InlineButton[]> {
+            new[] { InlineButton.WithCallbackData("🎥 Pvideo", $"set_dir|{currentMsgId}|Pvideo"), InlineButton.WithCallbackData("🖼 Pimages", $"set_dir|{currentMsgId}|Pimages") },
+            new[] { InlineButton.WithCallbackData("🔀 Pmix", $"set_dir|{currentMsgId}|Pmix"), InlineButton.WithCallbackData("🌟 OnlyK", $"set_dir|{currentMsgId}|OnlyK") },
+            new[] { InlineButton.WithCallbackData("🎞 Hvideo", $"set_dir|{currentMsgId}|Hvideo"), InlineButton.WithCallbackData("🎨 Himages", $"set_dir|{currentMsgId}|Himages") },
+            new[] { InlineButton.WithCallbackData("📚 Hmanga", $"set_dir|{currentMsgId}|Hmanga"), InlineButton.WithCallbackData("🔀 Hmix", $"set_dir|{currentMsgId}|Hmix") },
+            new[] { InlineButton.WithCallbackData("👾 Hgame", $"set_dir|{currentMsgId}|Hgame"), InlineButton.WithCallbackData("🗑 Trash", $"set_dir|{currentMsgId}|TRASH") },
+            new[] { InlineButton.WithCallbackData("⏩ Далее", "next_msg"), InlineButton.WithCallbackData("🔙 В меню", "menu") }
+        };
+
+        if (_lastPreviewedMsgId != currentMsgId)
+        {
+            _repository.RequestPreview(currentMsgId);
+            _lastPreviewedMsgId = currentMsgId;
+            await Task.Delay(1000);
+        }
+
+        if (msgIdToEdit.HasValue)
+        {
+            try { await _botClient.DeleteMessage(chatId, msgIdToEdit.Value); } catch { }
+        }
+
+        var msg = await _botClient.SendMessage(chatId, text, replyMarkup: new InlineKeyboard(btns), parseMode: ParseMode.Html);
+        _repository.SetActiveMenu(chatId, msg.MessageId);
     }
 
     private async Task ShowNextUntaggedChannel(ITelegramBotClient bot, long chatId, int? msgId, bool isNewMessage = false)
@@ -166,43 +259,6 @@ public class UiBotWorker : BackgroundService
         else { await bot.EditMessageText(chatId, msgId.Value, text, replyMarkup: kb, parseMode: ParseMode.Html); }
     }
 
-    private async Task ShowNextUntaggedDirect(ITelegramBotClient bot, long chatId, int? msgId, bool isNewMessage = false)
-    {
-        var next = _repository.GetPendingDirectMessages().FirstOrDefault(d => !_skippedItems.Contains("dir_" + d.Key));
-        if (next.Key == 0) { await ShowMainMenu(bot, chatId, msgId, isNewMessage); return; }
-
-        var btns = new List<InlineButton[]> {
-            new[] { InlineButton.WithCallbackData("🔀 Pmix (Смешанное)", $"set_dir|{next.Key}|Pmix") },
-            new[] { InlineButton.WithCallbackData("🔀 Hmix (Смешанное)", $"set_dir|{next.Key}|Hmix") },
-            new[] { InlineButton.WithCallbackData("🗑 В Trash (Мусор)", $"set_dir|{next.Key}|TRASH") },
-            new[] { InlineButton.WithCallbackData("⏩ Пропустить", $"skip_dir|{next.Key}"), InlineButton.WithCallbackData("🔙 В меню", "menu") }
-        };
-
-        // --- ИСПРАВЛЕНИЕ ---
-        // Сюда нужно вписать ID вашего канала/группы "Свалки" (обязательно с минусом в начале, если это группа/канал)
-        // Можно брать из , если добавите в .env
-        long sourceChatId = long.Parse(Environment.GetEnvironmentVariable("SOURCE_CHAT_ID"));
-
-        // Теперь ссылка генерируется на оригинальную Свалку, где лежит сообщение
-        string cleanChatId = sourceChatId.ToString().Replace("-100", "");
-        string msgUrl = $"https://t.me/c/{cleanChatId}/{next.Key}";
-
-        string text = $"Куда отправить файл/сообщение?\n👉 <a href=\"{msgUrl}\">Посмотреть оригинал в Свалке</a>\nПревью: <i>{next.Value.Replace("<", "").Replace(">", "")}</i>";
-
-        if (isNewMessage || msgId == null)
-        {
-            // Теперь бот будет корректно брать файл ИЗ свалки и присылать вам в меню для предпросмотра
-            try { await bot.CopyMessage(chatId, sourceChatId, next.Key); }
-            catch (Exception ex) { Console.WriteLine($"[ПРЕВЬЮ ОШИБКА] {ex.Message}"); }
-
-            var msg = await bot.SendMessage(chatId, text, replyMarkup: new InlineKeyboard(btns), parseMode: ParseMode.Html);
-            _repository.SetActiveMenu(chatId, msg.MessageId);
-        }
-        else
-        {
-            await bot.EditMessageText(chatId, msgId.Value, text, replyMarkup: new InlineKeyboard(btns), parseMode: ParseMode.Html);
-        }
-    }
     private async Task ShowCategoriesForEdit(ITelegramBotClient bot, long chatId, int msgId)
     {
         var ch = _repository.GetMappings(); var dom = _repository.GetDomainMappings();
@@ -218,9 +274,6 @@ public class UiBotWorker : BackgroundService
         await bot.EditMessageText(chatId, msgId, "📂 <b>Выберите категорию:</b>", replyMarkup: new InlineKeyboard(buttons), parseMode: ParseMode.Html);
     }
 
-    // =====================================
-    // ПАГИНАЦИЯ ДЛЯ СПИСКА КАНАЛОВ (ПО 20)
-    // =====================================
     private async Task ShowItemsByTag(ITelegramBotClient bot, long chatId, int msgId, string tag, int page = 0)
     {
         int pageSize = 20;
@@ -259,7 +312,10 @@ public class UiBotWorker : BackgroundService
         btns.Add(new[] { InlineButton.WithCallbackData("🔀 Pmix (Авто)", $"set_{type}|{id}|Pmix"), InlineButton.WithCallbackData("🌟 OnlyK", $"set_{type}|{id}|OnlyK") });
         btns.Add(new[] { InlineButton.WithCallbackData("🎞 Hvideo", $"set_{type}|{id}|Hvideo"), InlineButton.WithCallbackData("🎨 Himages", $"set_{type}|{id}|Himages") });
         btns.Add(new[] { InlineButton.WithCallbackData("📚 Hmanga", $"set_{type}|{id}|Hmanga"), InlineButton.WithCallbackData("🔀 Hmix (Авто)", $"set_{type}|{id}|Hmix") });
-        btns.Add(new[] { InlineButton.WithCallbackData("👾 Hgame", $"set_{type}|{id}|Hgame") });
+
+        // ЗДЕСЬ ДОБАВЛЕНА КНОПКА MANUAL:
+        btns.Add(new[] { InlineButton.WithCallbackData("👾 Hgame", $"set_{type}|{id}|Hgame"), InlineButton.WithCallbackData("🤔 Спрашивать", $"set_{type}|{id}|MANUAL") });
+
         btns.Add(new[] { InlineButton.WithCallbackData("⏩ Пропустить", $"skip_{type}|{id}"), InlineButton.WithCallbackData("🚫 Игнор", $"ignore_{type}|{id}") });
         btns.Add(new[] { InlineButton.WithCallbackData("🔙 В меню", "menu") });
         return new InlineKeyboard(btns);

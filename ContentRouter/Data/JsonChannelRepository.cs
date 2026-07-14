@@ -29,7 +29,9 @@ public class JsonChannelRepository : IChannelRepository
     public event Action<long, string> OnChannelTagAssigned;
     public event Action<string, string> OnDomainTagAssigned;
     public event Action<int, string> OnDirectMessageTagAssigned;
+    public event Action<int> OnPreviewRequested;
 
+    public void RequestPreview(int messageId) { OnPreviewRequested?.Invoke(messageId); }
     private const string DB_FILE = "channels_db.json";
     private DatabaseModel _db = new();
     private readonly object _lock = new();

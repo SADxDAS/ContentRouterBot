@@ -7,7 +7,8 @@ public interface IChannelRepository
     event Action<long, string> OnChannelTagAssigned;
     event Action<string, string> OnDomainTagAssigned;
     event Action<int, string> OnDirectMessageTagAssigned;
-
+    event Action<int> OnPreviewRequested;
+    void RequestPreview(int messageId);
     bool IsPaused { get; set; }
 
     string GetTagForChannel(long channelId);
