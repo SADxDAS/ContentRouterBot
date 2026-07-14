@@ -44,6 +44,8 @@ public class JsonChannelRepository : IChannelRepository
         if (_db.ChannelCache == null) _db.ChannelCache = new Dictionary<long, ChannelCacheItem>();
         if (_db.PendingDirectMessages == null) _db.PendingDirectMessages = new Dictionary<int, string>();
         if (_db.AvailableDomains == null) _db.AvailableDomains = new Dictionary<string, int>();
+        _db.PendingDirectMessages.Clear();
+        Save();
     }
 
     private void Save() => File.WriteAllText(DB_FILE, JsonSerializer.Serialize(_db));

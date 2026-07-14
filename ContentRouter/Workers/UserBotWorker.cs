@@ -11,7 +11,11 @@ using TlMessage = TL.Message;
 using TlChannel = TL.Channel;
 using TlPeerChannel = TL.PeerChannel;
 using TlUpdatesBase = TL.UpdatesBase;
-
+public class RouteInfo
+{
+    public string Chat { get; set; }
+    public int? TopicId { get; set; }
+}
 public class UserBotWorker : BackgroundService
 {
     private readonly IChannelRepository _repository;
@@ -25,8 +29,7 @@ public class UserBotWorker : BackgroundService
     // ========================================================
     // ДИНАМИЧЕСКИЕ ПРАВИЛА ИЗ routing.json
     // ========================================================
-    private Dictionary<string, (string Chat, int? TopicId)> _routingRules = new();
-
+    private Dictionary<string, RouteInfo> _routingRules = new();
     public UserBotWorker(IChannelRepository repository)
     {
         _repository = repository;
@@ -40,7 +43,10 @@ public class UserBotWorker : BackgroundService
             if (System.IO.File.Exists("routing.json"))
             {
                 string json = System.IO.File.ReadAllText("routing.json");
-                _routingRules = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, (string Chat, int? TopicId)>>(json);
+
+                // ЗМІНИ ТУТ (було Dictionary<string, (string Chat, int? TopicId)>)
+                _routingRules = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, RouteInfo>>(json);
+
                 Console.WriteLine($"[СИСТЕМА] Загружено {_routingRules.Count} правил из routing.json");
             }
             else
@@ -50,7 +56,6 @@ public class UserBotWorker : BackgroundService
         }
         catch (Exception ex) { Console.WriteLine($"[ОШИБКА JSON] {ex.Message}"); }
     }
-
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         client = new Client(Config);
@@ -153,8 +158,7 @@ public class UserBotWorker : BackgroundService
 
     private async Task ProcessMessageGroup(List<TlMessage> msgs, InputPeer sourcePeer, bool isSourceChannel, string predefinedTag = null)
     {
-        if (_repository.IsPaused) return; // ПРОВЕРКА НА ПАУЗУ
-
+        if (_repository.IsPaused && predefinedTag == null) return;
         msgs = msgs.Where(msg =>
         {
             string text = msg.message ?? "";
@@ -328,14 +332,19 @@ public class UserBotWorker : BackgroundService
                     if (isSourceChannel && sourcePeer is InputPeerChannel inputChannel) await client.Channels_DeleteMessages(inputChannel, msgIds);
                     else await client.Messages_DeleteMessages(msgIds, revoke: true);
 
-                    Console.WriteLine($"[УСПЕХ] Отправлено в {targetTag} ({(isDomainRouting ? "по домену" : "по каналу")})");
+                    Console.WriteLine($"[УСПІХ] Відправлено в {targetTag} ({(isDomainRouting ? "по домену" : "по каналу або вручну")})");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"[ОШИБКА ПЕРЕСЫЛКИ] ID: {msgIds.FirstOrDefault()} -> {ex.Message}");
+                    Console.WriteLine($"[ПОМИЛКА ПЕРЕСИЛАННЯ] ID: {msgIds.FirstOrDefault()} -> {ex.Message}");
                 }
 
                 await Task.Delay(1000);
+            }
+            else
+            {
+                // ДОДАЙ ЦЕЙ БЛОК: Тепер бот скаже, якщо не може знайти цільовий чат
+                Console.WriteLine($"[ПОМИЛКА МАРШРУТИЗАЦІЇ] Чат призначення '{route.Chat}' не знайдено у списку діалогів! Пересилання скасовано.");
             }
         }
     }
