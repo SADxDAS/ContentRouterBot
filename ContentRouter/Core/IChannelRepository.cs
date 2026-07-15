@@ -10,7 +10,8 @@ public interface IChannelRepository
     event Action<int> OnPreviewRequested;
     void RequestPreview(int messageId);
     bool IsPaused { get; set; }
-
+    event Action OnForceScanRequested;
+    void RequestForceScan();
     string GetTagForChannel(long channelId);
     void SaveTag(long channelId, string tag);
     void RemoveTag(long channelId);

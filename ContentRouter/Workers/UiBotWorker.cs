@@ -16,10 +16,12 @@ using InlineButton = Telegram.Bot.Types.ReplyMarkups.InlineKeyboardButton;
 public class UiBotWorker : BackgroundService
 {
     private readonly IChannelRepository _repository;
-    private readonly string[] _tags = { "Pvideo", "Pimages", "OnlyK", "Himages", "Hvideo", "Hmanga", "Hmix", "Hgame", "IGNORE", "OTHER", "MANUAL" }; private readonly HashSet<string> _skippedItems = new();
+    private readonly string[] _tags = { "Pvideo", "Pimages", "OnlyK", "Himages", "Hvideo", "Hmanga", "Hmix", "Hgame", "IGNORE", "OTHER", "MANUAL","Pmix" }; 
+    private readonly HashSet<string> _skippedItems = new();
     private ITelegramBotClient _botClient;
     private int _currentPreviewIndex = 0;
-
+    private readonly HashSet<int> _ignoredPreviewIds = new();
+    private bool _isScanning = false;
     private int _lastPreviewedMsgId = 0;
     private CancellationTokenSource _debounceCts;
 
@@ -94,16 +96,29 @@ public class UiBotWorker : BackgroundService
             var msg = update.Message;
             if (msg != null)
             {
-                if (msg.Text == "/start" || msg.Text == "/menu")
+                // Если это команда (начинается со слэша)
+                if (!string.IsNullOrEmpty(msg.Text) && msg.Text.StartsWith("/"))
                 {
+                    // Сразу удаляем команду из чата
                     try { await bot.DeleteMessage(msg.Chat.Id, msg.MessageId); } catch { }
-                    var activeMenu = _repository.GetActiveMenu();
-                    if (activeMenu != null) try { await bot.DeleteMessage(activeMenu.Value.ChatId, activeMenu.Value.MessageId); } catch { }
-                    await ShowMainMenu(bot, msg.Chat.Id, isNewMessage: true);
+
+                    if (msg.Text == "/start" || msg.Text == "/menu")
+                    {
+                        var activeMenu = _repository.GetActiveMenu();
+                        if (activeMenu != null) try { await bot.DeleteMessage(activeMenu.Value.ChatId, activeMenu.Value.MessageId); } catch { }
+                        await ShowMainMenu(bot, msg.Chat.Id, isNewMessage: true);
+                    }
+                    else if (msg.Text == "/scan")
+                    {
+                        _repository.RequestForceScan();
+                        var tempMsg = await bot.SendMessage(msg.Chat.Id, "🔄 Сканирование истории запущено заново...");
+                        await Task.Delay(3000); // Показываем сообщение 3 секунды
+                        try { await bot.DeleteMessage(msg.Chat.Id, tempMsg.MessageId); } catch { } // Удаляем уведомление
+                    }
                 }
                 else
                 {
-                    // ДОБАВЛЕНО: Если это не команда, значит это пересланное превью от юзербота. Сохраняем его ID.
+                    // Сохраняем ID пересланного юзерботом превью
                     _previewMessageIds.Add(msg.MessageId);
                 }
             }
@@ -126,14 +141,13 @@ public class UiBotWorker : BackgroundService
 
                 else if (action == "next_msg") { await ClearPreviews(bot, cq.Message.Chat.Id); _currentPreviewIndex++; await ShowCurrentMessageMenu(cq.Message.Chat.Id, cq.Message.MessageId); }
 
-                else if (action == "set_ch") { _repository.SaveTag(long.Parse(data[1]), data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "ignore_ch") { _repository.SaveTag(long.Parse(data[1]), "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "skip_ch") { _skippedItems.Add(data[1]); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "set_ch") { await ClearPreviews(bot, cq.Message.Chat.Id); _repository.SaveTag(long.Parse(data[1]), data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "ignore_ch") { await ClearPreviews(bot, cq.Message.Chat.Id); _repository.SaveTag(long.Parse(data[1]), "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "skip_ch") { await ClearPreviews(bot, cq.Message.Chat.Id); _skippedItems.Add(data[1]); await ShowNextUntaggedChannel(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
 
-                else if (action == "set_dom") { _repository.SaveDomainTag(data[1], data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "ignore_dom") { _repository.SaveDomainTag(data[1], "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-                else if (action == "skip_dom") { _skippedItems.Add(data[1]); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
-
+                else if (action == "set_dom") { await ClearPreviews(bot, cq.Message.Chat.Id); _repository.SaveDomainTag(data[1], data[2]); await bot.AnswerCallbackQuery(cq.Id, $"✅ {data[2]}"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "ignore_dom") { await ClearPreviews(bot, cq.Message.Chat.Id); _repository.SaveDomainTag(data[1], "IGNORE"); await bot.AnswerCallbackQuery(cq.Id, "🚫 Скрыто"); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
+                else if (action == "skip_dom") { await ClearPreviews(bot, cq.Message.Chat.Id); _skippedItems.Add(data[1]); await ShowNextUntaggedDomain(bot, cq.Message.Chat.Id, cq.Message.MessageId); }
                 else if (action == "set_dir")
                 {
                     await ClearPreviews(bot, cq.Message.Chat.Id); // Удаляем превью после выбора тега
@@ -188,8 +202,10 @@ public class UiBotWorker : BackgroundService
         if (pendingMsgs.Count == 0)
         {
             string emptyText = "🎉 Все файлы из Свалки отсортированы!";
-            if (msgIdToEdit.HasValue) try { await _botClient.EditMessageText(chatId, msgIdToEdit.Value, emptyText); } catch { }
-            else await _botClient.SendMessage(chatId, emptyText);
+            var kb = new InlineKeyboard(new[] { new[] { InlineButton.WithCallbackData("🔙 В меню", "menu") } });
+
+            if (msgIdToEdit.HasValue) try { await _botClient.EditMessageText(chatId, msgIdToEdit.Value, emptyText, replyMarkup: kb); } catch { }
+            else await _botClient.SendMessage(chatId, emptyText, replyMarkup: kb);
             return;
         }
 
@@ -225,40 +241,58 @@ public class UiBotWorker : BackgroundService
         _repository.SetActiveMenu(chatId, msg.MessageId);
     }
 
-    private async Task ShowNextUntaggedChannel(ITelegramBotClient bot, long chatId, int? msgId, bool isNewMessage = false)
+    private async Task ShowNextUntaggedChannel(ITelegramBotClient bot, long chatId, int? msgIdToEdit, bool isNewMessage = false)
     {
         var next = _repository.GetAvailableChannels().FirstOrDefault(c => !_repository.GetMappings().ContainsKey(c.Key) && !_skippedItems.Contains(c.Key.ToString()));
-        if (next.Key == 0) { await ShowMainMenu(bot, chatId, msgId, isNewMessage); return; }
+        if (next.Key == 0) { await ShowMainMenu(bot, chatId, msgIdToEdit, isNewMessage); return; }
 
-        string text = $"Куда отправлять посты из канала:\n👉 <b>{next.Value.Title.Replace("<", "").Replace(">", "")}</b>";
+        string text = $"Куда отправлять посты из канала:\n👉 <b>{next.Value.Title.Replace("<", "").Replace(">", "")}</b>\n⬆️ <i>Превью контента загружено выше</i>";
         var kb = GetTagsKeyboard(next.Key.ToString(), "ch", next.Value.Url);
 
-        if (isNewMessage || msgId == null)
+        int triggerMsgId = next.Value.TriggerMsgId;
+        // Запрашиваем превью у Юзербота
+        if (triggerMsgId != 0 && _lastPreviewedMsgId != triggerMsgId)
         {
-            try { await bot.CopyMessage(chatId, chatId, next.Value.TriggerMsgId); } catch { }
-            var msg = await bot.SendMessage(chatId, text, replyMarkup: kb, parseMode: ParseMode.Html);
-            _repository.SetActiveMenu(chatId, msg.MessageId);
+            _repository.RequestPreview(triggerMsgId);
+            _lastPreviewedMsgId = triggerMsgId;
+            await Task.Delay(1000); // Даем юзерботу секунду на пересылку превью
         }
-        else { await bot.EditMessageText(chatId, msgId.Value, text, replyMarkup: kb, parseMode: ParseMode.Html); }
-    }
 
-    private async Task ShowNextUntaggedDomain(ITelegramBotClient bot, long chatId, int? msgId, bool isNewMessage = false)
+        // Удаляем старое меню, чтобы новое появилось СТРОГО ПОД превью
+        if (msgIdToEdit.HasValue)
+        {
+            try { await bot.DeleteMessage(chatId, msgIdToEdit.Value); } catch { }
+        }
+
+        var msg = await bot.SendMessage(chatId, text, replyMarkup: kb, parseMode: ParseMode.Html);
+        _repository.SetActiveMenu(chatId, msg.MessageId);
+    }
+    private async Task ShowNextUntaggedDomain(ITelegramBotClient bot, long chatId, int? msgIdToEdit, bool isNewMessage = false)
     {
         var next = _repository.GetAvailableDomains().FirstOrDefault(d => !_repository.GetDomainMappings().ContainsKey(d.Key) && !_skippedItems.Contains(d.Key));
-        if (next.Key == null) { await ShowMainMenu(bot, chatId, msgId, isNewMessage); return; }
+        if (next.Key == null) { await ShowMainMenu(bot, chatId, msgIdToEdit, isNewMessage); return; }
 
-        string text = $"Куда отправлять ссылки с доменом:\n👉 <b>{next.Key}</b>";
+        string text = $"Куда отправлять ссылки с доменом:\n👉 <b>{next.Key}</b>\n⬆️ <i>Превью контента загружено выше</i>";
         var kb = GetTagsKeyboard(next.Key, "dom", null);
 
-        if (isNewMessage || msgId == null)
+        int triggerMsgId = next.Value;
+        // Запрашиваем превью у Юзербота
+        if (triggerMsgId != 0 && _lastPreviewedMsgId != triggerMsgId)
         {
-            try { await bot.CopyMessage(chatId, chatId, next.Value); } catch { }
-            var msg = await bot.SendMessage(chatId, text, replyMarkup: kb, parseMode: ParseMode.Html);
-            _repository.SetActiveMenu(chatId, msg.MessageId);
+            _repository.RequestPreview(triggerMsgId);
+            _lastPreviewedMsgId = triggerMsgId;
+            await Task.Delay(1000); // Даем юзерботу секунду на пересылку превью
         }
-        else { await bot.EditMessageText(chatId, msgId.Value, text, replyMarkup: kb, parseMode: ParseMode.Html); }
-    }
 
+        // Удаляем старое меню, чтобы новое появилось СТРОГО ПОД превью
+        if (msgIdToEdit.HasValue)
+        {
+            try { await bot.DeleteMessage(chatId, msgIdToEdit.Value); } catch { }
+        }
+
+        var msg = await bot.SendMessage(chatId, text, replyMarkup: kb, parseMode: ParseMode.Html);
+        _repository.SetActiveMenu(chatId, msg.MessageId);
+    }
     private async Task ShowCategoriesForEdit(ITelegramBotClient bot, long chatId, int msgId)
     {
         var ch = _repository.GetMappings(); var dom = _repository.GetDomainMappings();

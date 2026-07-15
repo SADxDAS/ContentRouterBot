@@ -30,6 +30,10 @@ public class UserBotWorker : BackgroundService
 
     private Dictionary<string, RouteInfo> _routingRules = new();
 
+    // Специальные переменные для новой логики
+    private readonly HashSet<int> _ignoredPreviewIds = new();
+    private bool _isScanning = false;
+
     public UserBotWorker(IChannelRepository repository)
     {
         _repository = repository;
@@ -66,39 +70,52 @@ public class UserBotWorker : BackgroundService
 
         string sourceChatName = Environment.GetEnvironmentVariable("SOURCE_CHAT_NAME") ?? "Свалка";
 
-        var sourceChat = _allChats.Values.FirstOrDefault(c => c.Title == sourceChatName);
-        if (sourceChat != null) { _sourcePeer = sourceChat; _isSourceChannel = sourceChat is TlChannel; Console.WriteLine($"[USERBOT-WORKER] Слушаю чат: {sourceChat.Title}"); }
+        if (sourceChatName.ToLower() == "избранное" || sourceChatName.ToLower() == "me" || sourceChatName.ToLower() == "saved messages")
+        {
+            _sourcePeer = InputPeer.Self;
+            _isSourceChannel = false;
+            Console.WriteLine("[USERBOT-WORKER] Слушаю 'Избранное' (Saved Messages).");
+        }
         else
         {
-            string cleanName = sourceChatName.Replace("@", "").ToLower();
-            var sourceUser = allUsers.FirstOrDefault(u => (u.username != null && u.username.ToLower() == cleanName) || u.first_name == sourceChatName);
-            if (sourceUser != null) { _sourcePeer = sourceUser; Console.WriteLine($"[USERBOT-WORKER] Слушаю бота: {sourceUser.username}"); }
-            else Console.WriteLine($"\n[КРИТИЧЕСКАЯ ОШИБКА] Свалка '{sourceChatName}' не найдена!");
+            var sourceChat = _allChats.Values.FirstOrDefault(c => c.Title == sourceChatName);
+            if (sourceChat != null) { _sourcePeer = sourceChat; _isSourceChannel = sourceChat is TlChannel; Console.WriteLine($"[USERBOT-WORKER] Слушаю чат: {sourceChat.Title}"); }
+            else
+            {
+                string cleanName = sourceChatName.Replace("@", "").ToLower();
+                var sourceUser = allUsers.FirstOrDefault(u => (u.username != null && u.username.ToLower() == cleanName) || u.first_name == sourceChatName);
+                if (sourceUser != null) { _sourcePeer = sourceUser; Console.WriteLine($"[USERBOT-WORKER] Слушаю бота: {sourceUser.username}"); }
+                else Console.WriteLine($"\n[КРИТИЧЕСКАЯ ОШИБКА] Свалка '{sourceChatName}' не найдена!");
+            }
         }
 
         _repository.OnChannelTagAssigned += (channelId, tag) => { _ = Task.Run(async () => { List<(List<TlMessage> Msgs, long? ChannelId, string Domain, int? DirectMsgId)> toProcess; lock (_pendingGroups) { toProcess = _pendingGroups.Where(p => p.ChannelId == channelId).ToList(); foreach (var p in toProcess) _pendingGroups.Remove(p); } foreach (var p in toProcess) await ProcessMessageGroup(p.Msgs, _sourcePeer, _isSourceChannel); }); };
         _repository.OnDomainTagAssigned += (domain, tag) => { _ = Task.Run(async () => { List<(List<TlMessage> Msgs, long? ChannelId, string Domain, int? DirectMsgId)> toProcess; lock (_pendingGroups) { toProcess = _pendingGroups.Where(p => p.Domain == domain).ToList(); foreach (var p in toProcess) _pendingGroups.Remove(p); } foreach (var p in toProcess) await ProcessMessageGroup(p.Msgs, _sourcePeer, _isSourceChannel); }); };
         _repository.OnDirectMessageTagAssigned += (msgId, tag) => { _ = Task.Run(async () => { List<(List<TlMessage> Msgs, long? ChannelId, string Domain, int? DirectMsgId)> toProcess; lock (_pendingGroups) { toProcess = _pendingGroups.Where(p => p.DirectMsgId == msgId).ToList(); foreach (var p in toProcess) _pendingGroups.Remove(p); } foreach (var p in toProcess) await ProcessMessageGroup(p.Msgs, _sourcePeer, _isSourceChannel, tag); }); };
 
-        // ЗМІНА ТУТ: Обробка запиту на пересилання прев'ю від UI бота
         _repository.OnPreviewRequested += (msgId) =>
         {
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    // Шукаємо твого бота @hoomelanderbot в контактах/діалогах
                     var botikUser = allUsers.FirstOrDefault(u => u.username != null && u.username.ToLower() == "hoomelanderbot");
                     InputPeer targetPeer = botikUser;
 
                     if (targetPeer != null && _sourcePeer != null)
                     {
-                        await client.Messages_ForwardMessages(
+                        var updates = await client.Messages_ForwardMessages(
                             from_peer: _sourcePeer,
                             id: new[] { msgId },
                             random_id: new[] { WTelegram.Helpers.RandomLong() },
                             to_peer: targetPeer
                         );
+
+                        // Сохраняем ID пересланного превью, чтобы юзербот не принял его за мусор
+                        foreach (var u in updates.UpdateList)
+                        {
+                            if (u is UpdateNewMessage unm && unm.message is TlMessage m) _ignoredPreviewIds.Add(m.id);
+                        }
                     }
                     else
                     {
@@ -109,81 +126,15 @@ public class UserBotWorker : BackgroundService
             });
         };
 
+        // Подписываемся на команду /scan из UI
+        _repository.OnForceScanRequested += StartDeepScan;
+
+        // Запускаем сканирование при старте
         if (_sourcePeer != null)
         {
-            _ = Task.Run(async () =>
-            {
-                Console.WriteLine("[USERBOT-WORKER] Начинаю глубокое сканирование истории...");
-                int offsetId = 0;
-                int errorCount = 0; // Защита от бесконечного зацикливания
-
-                while (true)
-                {
-                    if (_repository.IsPaused)
-                    {
-                        await Task.Delay(2000);
-                        continue;
-                    }
-
-                    try
-                    {
-                        var history = await client.Messages_GetHistory(_sourcePeer, limit: 100, offset_id: offsetId);
-
-                        if (history == null || history.Messages.Length == 0)
-                        {
-                            Console.WriteLine("[USERBOT-WORKER] Конец истории достигнут (0 сообщений).");
-                            break;
-                        }
-
-                        var messages = history.Messages.OfType<TlMessage>().ToList();
-                        var historyGroups = messages.GroupBy(m => m.grouped_id == 0 ? m.id : m.grouped_id).ToList();
-
-                        foreach (var group in historyGroups)
-                        {
-                            if (group.Any())
-                            {
-                                try { await ProcessMessageGroup(group.ToList(), _sourcePeer, _isSourceChannel); }
-                                catch (Exception ex) { Console.WriteLine($"[ОШИБКА ОБРАБОТКИ ПАКЕТА] {ex.Message}"); }
-                            }
-                        }
-
-                        offsetId = history.Messages.Min(m => m.ID);
-                        errorCount = 0; // Сбрасываем счетчик при успехе
-
-                        await Task.Delay(500);
-                    }
-                    catch (Exception ex)
-                    {
-                        errorCount++;
-                        Console.WriteLine($"[ОШИБКА СКАНИРОВАНИЯ] {ex.Message}");
-
-                        // Если Телеграм ругается на спам запросами (FloodWait)
-                        if (ex.Message.Contains("FLOOD_WAIT_"))
-                        {
-                            var match = Regex.Match(ex.Message, @"FLOOD_WAIT_(\d+)");
-                            if (match.Success && int.TryParse(match.Groups[1].Value, out int sec))
-                            {
-                                Console.WriteLine($"[ПАУЗА] Телеграм просит подождать {sec} секунд...");
-                                await Task.Delay((sec + 2) * 1000);
-                            }
-                            else await Task.Delay(5000);
-                        }
-                        else
-                        {
-                            await Task.Delay(3000);
-                            // Если ошибка повторяется 3 раза на одном сообщении, принудительно перешагиваем его
-                            if (errorCount >= 3)
-                            {
-                                Console.WriteLine("[СДВИГ] Принудительно пропускаем битый блок истории...");
-                                offsetId = Math.Max(0, offsetId - 1);
-                                errorCount = 0;
-                            }
-                        }
-                    }
-                }
-                Console.WriteLine("[USERBOT-WORKER] Вся история полностью разобрана.");
-            });
+            StartDeepScan();
         }
+
         client.OnUpdates += async (TL.UpdatesBase updates) =>
         {
             if (_sourcePeer == null) return;
@@ -220,25 +171,128 @@ public class UserBotWorker : BackgroundService
         while (!stoppingToken.IsCancellationRequested) await Task.Delay(1000, stoppingToken);
     }
 
+    private void StartDeepScan()
+    {
+        if (_isScanning) return; // Защита от двойного запуска
+
+        _ = Task.Run(async () =>
+        {
+            _isScanning = true;
+            try
+            {
+                Console.WriteLine("[USERBOT-WORKER] Начинаю глубокое сканирование истории...");
+                int offsetId = 0;
+                int errorCount = 0;
+
+                while (true)
+                {
+                    if (_repository.IsPaused)
+                    {
+                        await Task.Delay(2000);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var history = await client.Messages_GetHistory(_sourcePeer, limit: 100, offset_id: offsetId);
+
+                        Dictionary<long, ChatBase> historyChats = new();
+                        if (history is TL.Messages_Messages mm) historyChats = mm.chats;
+                        else if (history is TL.Messages_MessagesSlice ms) historyChats = ms.chats;
+                        else if (history is TL.Messages_ChannelMessages cm) historyChats = cm.chats;
+                        foreach (var c in historyChats) _allChats[c.Key] = c.Value;
+
+                        if (history == null || history.Messages.Length == 0)
+                        {
+                            Console.WriteLine("[USERBOT-WORKER] Конец истории достигнут (0 сообщений).");
+                            break;
+                        }
+
+                        var messages = history.Messages.OfType<TlMessage>().ToList();
+                        var historyGroups = messages.GroupBy(m => m.grouped_id == 0 ? m.id : m.grouped_id).ToList();
+
+                        foreach (var group in historyGroups)
+                        {
+                            if (group.Any())
+                            {
+                                try { await ProcessMessageGroup(group.ToList(), _sourcePeer, _isSourceChannel); }
+                                catch (Exception ex) { Console.WriteLine($"[ОШИБКА ОБРАБОТКИ ПАКЕТА] {ex.Message}"); }
+                            }
+                        }
+
+                        offsetId = history.Messages.Min(m => m.ID);
+                        errorCount = 0;
+
+                        await Task.Delay(500);
+                    }
+                    catch (Exception ex)
+                    {
+                        errorCount++;
+                        if (ex.Message.Contains("FLOOD_WAIT_"))
+                        {
+                            var match = Regex.Match(ex.Message, @"FLOOD_WAIT_(\d+)");
+                            if (match.Success && int.TryParse(match.Groups[1].Value, out int sec))
+                            {
+                                Console.WriteLine($"[ПАУЗА] Телеграм просит подождать {sec} секунд...");
+                                await Task.Delay((sec + 2) * 1000);
+                            }
+                            else await Task.Delay(5000);
+                        }
+                        else
+                        {
+                            await Task.Delay(3000);
+                            if (errorCount >= 3)
+                            {
+                                Console.WriteLine("[СДВИГ] Принудительно пропускаем битый блок истории...");
+                                offsetId = Math.Max(0, offsetId - 1);
+                                errorCount = 0;
+                            }
+                        }
+                    }
+                }
+                Console.WriteLine("[USERBOT-WORKER] Вся история полностью разобрана.");
+            }
+            finally
+            {
+                _isScanning = false; // Разрешаем сканировать снова
+            }
+        });
+    }
+
     private async Task ProcessMessageGroup(List<TlMessage> msgs, InputPeer sourcePeer, bool isSourceChannel, string predefinedTag = null)
     {
-        // Пропускаем паузу, если тег передается вручную из меню
         if (_repository.IsPaused && predefinedTag == null) return;
 
         msgs = msgs.Where(msg =>
         {
+            // 1. Игнорируем только те сообщения, которые юзербот переслал как превью
+            if (_ignoredPreviewIds.Contains(msg.id)) return false;
+
             string text = msg.message ?? "";
+
+            // 2. Игнорируем технические команды бота (/scan, /menu и т.д.)
             if (text.StartsWith("/")) return false;
+
+            // 3. Игнорируем тексты UI-менюшек
             if (text.Contains("Маршрутизатор (SingleApp)")) return false;
+            if (text.Contains("Куда отправить сообщение")) return false;
+            if (text.Contains("Куда отправлять посты")) return false;
+            if (text.Contains("Куда отправлять ссылки")) return false;
+            if (text.Contains("Выберите категорию")) return false;
+            if (text.Contains("Привязки для")) return false;
+            if (text.Contains("Все файлы из Свалки отсортированы")) return false;
+            if (text.Contains("Сканирование истории запущено")) return false;
+
             var activeMenu = _repository.GetActiveMenu();
             if (activeMenu != null && msg.id == activeMenu.Value.MessageId) return false;
+
             return true;
         }).ToList();
 
         if (msgs.Count == 0) return;
 
         string content = string.Join(" ", msgs.Select(m => m.message?.Trim()).Where(s => !string.IsNullOrEmpty(s)));
-        // --- НОВИЙ БЛОК: Видаляємо заблоковані повідомлення ---
+
         bool isBlockedByTelegram = content.Contains("couldn't be displayed on your device") ||
                                    content.Contains("violates the Telegram Terms of Service");
         if (isBlockedByTelegram)
@@ -251,8 +305,9 @@ public class UserBotWorker : BackgroundService
                 else await client.Messages_DeleteMessages(badIds, revoke: true);
             }
             catch { }
-            return; // Виходимо, щоб не намагатися його переслати
+            return;
         }
+
         string targetTag = predefinedTag;
         bool isDomainRouting = false;
 
@@ -303,7 +358,6 @@ public class UserBotWorker : BackgroundService
                     {
                         string mappedTag = _repository.GetTagForChannel(pc.channel_id);
 
-                        // --- ИЗМЕНЕНИЕ ДЛЯ MANUAL (Каналы) ---
                         if (mappedTag == "MANUAL")
                         {
                             int firstMsgId = msgs.First().id;
@@ -316,11 +370,10 @@ public class UserBotWorker : BackgroundService
                         else
                         {
                             var fwdChat = _allChats.ContainsKey(pc.channel_id) ? _allChats[pc.channel_id] : null;
-                            if (fwdChat != null)
-                            {
-                                string url = fwdChat is TlChannel ch && !string.IsNullOrEmpty(ch.username) ? $"https://t.me/{ch.username}" : $"https://t.me/c/{fwdChat.ID}/1";
-                                _repository.AddAvailableChannel(pc.channel_id, fwdChat.Title, url, msgs.First().id);
-                            }
+                            string title = fwdChat != null ? fwdChat.Title : $"Скрытый/Новый канал ID: {pc.channel_id}";
+                            string url = fwdChat is TlChannel ch && !string.IsNullOrEmpty(ch.username) ? $"https://t.me/{ch.username}" : $"https://t.me/c/{pc.channel_id}/1";
+
+                            _repository.AddAvailableChannel(pc.channel_id, title, url, msgs.First().id);
 
                             lock (_pendingGroups) { _pendingGroups.Add((msgs, pc.channel_id, null, null)); }
                             return;
@@ -355,7 +408,6 @@ public class UserBotWorker : BackgroundService
                             {
                                 string mappedTag = _repository.GetTagForDomain(domain);
 
-                                // --- ИЗМЕНЕНИЕ ДЛЯ MANUAL (Домены) ---
                                 if (mappedTag == "MANUAL")
                                 {
                                     int firstMsgId = msgs.First().id;
@@ -400,7 +452,6 @@ public class UserBotWorker : BackgroundService
             }
         }
 
-        // Обработка составных тегов Hmix / Pmix
         if (targetTag == "Hmix" || targetTag == "Pmix")
         {
             bool hasVideo = msgs.Any(m => m.media is MessageMediaDocument doc &&
@@ -420,35 +471,53 @@ public class UserBotWorker : BackgroundService
             if (targetChat != null)
             {
                 int[] msgIds = msgs.Select(m => m.id).ToArray();
-                try
-                {
-                    await client.Messages_ForwardMessages(
-                        from_peer: sourcePeer,
-                        id: msgIds,
-                        random_id: msgs.Select(_ => WTelegram.Helpers.RandomLong()).ToArray(),
-                        to_peer: targetChat,
-                        top_msg_id: route.TopicId ?? 0
-                    );
 
-                    if (isSourceChannel && sourcePeer is InputPeerChannel inputChannel) await client.Channels_DeleteMessages(inputChannel, msgIds);
-                    else await client.Messages_DeleteMessages(msgIds, revoke: true);
-
-                    Console.WriteLine($"[УСПЕХ] Отправлено в {targetTag} ({(isDomainRouting ? "по домену" : "по каналу или вручную")})");
-                }
-                catch (Exception ex)
+                // Умный цикл ожидания и пересылки
+                int retries = 3;
+                while (retries > 0)
                 {
-                    Console.WriteLine($"[ОШИБКА ПЕРЕСЫЛКИ] ID: {msgIds.FirstOrDefault()} -> {ex.Message}");
+                    try
+                    {
+                        await client.Messages_ForwardMessages(
+                            from_peer: sourcePeer,
+                            id: msgIds,
+                            random_id: msgs.Select(_ => WTelegram.Helpers.RandomLong()).ToArray(),
+                            to_peer: targetChat,
+                            top_msg_id: route.TopicId ?? 0
+                        );
+
+                        if (isSourceChannel && sourcePeer is InputPeerChannel inputChannel) await client.Channels_DeleteMessages(inputChannel, msgIds);
+                        else await client.Messages_DeleteMessages(msgIds, revoke: true);
+
+                        Console.WriteLine($"[УСПЕХ] Отправлено в {targetTag} ({(isDomainRouting ? "по домену" : "по каналу или вручную")})");
+                        break; // Успех
+                    }
+                    catch (RpcException rpcEx) when (rpcEx.Code == 420)
+                    {
+                        int sec = rpcEx.X;
+                        if (sec == 0) sec = 60;
+
+                        Console.WriteLine($"\n[ОГРАНИЧЕНИЕ TELEGRAM] Ждем {sec} сек. (около {sec / 60} мин.). БОТ НЕ ЗАВИС, НЕ ВЫКЛЮЧАЙТЕ ЕГО!");
+                        await Task.Delay((sec + 2) * 1000);
+                        continue; // Пробуем снова
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[ОШИБКА ПЕРЕСЫЛКИ] ID: {msgIds.FirstOrDefault()} -> {ex.Message}");
+                        break;
+                    }
+                    retries--;
                 }
 
                 await Task.Delay(1000);
             }
             else
             {
-                // Логирование ошибки, если чат назначения не найден
                 Console.WriteLine($"[ОШИБКА МАРШРУТИЗАЦИИ] Чат назначения '{route.Chat}' не найден в списке диалогов! Пересылка отменена.");
             }
         }
     }
+
     private string? Config(string what)
     {
         switch (what)

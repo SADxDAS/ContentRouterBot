@@ -30,7 +30,8 @@ public class JsonChannelRepository : IChannelRepository
     public event Action<string, string> OnDomainTagAssigned;
     public event Action<int, string> OnDirectMessageTagAssigned;
     public event Action<int> OnPreviewRequested;
-
+    public event Action OnForceScanRequested;
+    public void RequestForceScan() { OnForceScanRequested?.Invoke(); }
     public void RequestPreview(int messageId) { OnPreviewRequested?.Invoke(messageId); }
     private const string DB_FILE = "channels_db.json";
     private DatabaseModel _db = new();
@@ -46,12 +47,34 @@ public class JsonChannelRepository : IChannelRepository
         if (_db.ChannelCache == null) _db.ChannelCache = new Dictionary<long, ChannelCacheItem>();
         if (_db.PendingDirectMessages == null) _db.PendingDirectMessages = new Dictionary<int, string>();
         if (_db.AvailableDomains == null) _db.AvailableDomains = new Dictionary<string, int>();
-        _db.PendingDirectMessages.Clear();
+        
+        //_db.PendingDirectMessages.Clear();
         Save();
     }
 
-    private void Save() => File.WriteAllText(DB_FILE, JsonSerializer.Serialize(_db));
-
+    private void Save()
+    {
+        string json = JsonSerializer.Serialize(_db);
+        int retries = 5;
+        while (retries > 0)
+        {
+            try
+            {
+                File.WriteAllText(DB_FILE, json);
+                break; // Успешно записали, выходим из цикла
+            }
+            catch (IOException)
+            {
+                retries--;
+                if (retries == 0)
+                {
+                    Console.WriteLine("[БД-ОШИБКА] Не удалось сохранить файл после 5 попыток.");
+                    break;
+                }
+                System.Threading.Thread.Sleep(100); // Ждем 100мс пока Windows отпустит файл
+            }
+        }
+    }
     public bool IsPaused { get { lock (_lock) return _db.IsPaused; } set { lock (_lock) { _db.IsPaused = value; Save(); } } }
 
     public string GetTagForChannel(long channelId) { lock (_lock) return _db.ChannelMappings.TryGetValue(channelId, out string tag) ? tag : null; }
